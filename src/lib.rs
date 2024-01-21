@@ -22,7 +22,12 @@ pub struct ConfigRedirect {
 }
 pub struct Config {
     pub addr: SocketAddr,
-    pub auth: fn(&ConfigRedirect, &HeaderMap, &hyper::http::request::Builder) -> (bool, String),
+    pub auth: fn(
+        &ConfigRedirect,
+        &HeaderMap,
+        &hyper::Client<HttpsConnector<HttpConnector>>,
+        &hyper::http::request::Builder,
+    ) -> (bool, String),
     pub clear_cache_interval_in_seconds: u64,
     pub redirects: HashMap<String, ConfigRedirect>,
 }
@@ -66,7 +71,8 @@ async fn handle_request(
         request_builder = request_builder.header(key.as_str(), value.as_str());
     }
 
-    let (is_authorized, auth_identifier) = (config.auth)(redirect, req.headers(), &request_builder);
+    let (is_authorized, auth_identifier) =
+        (config.auth)(redirect, req.headers(), &client, &request_builder);
 
     if !is_authorized {
         return Err(hyper::Response::builder()
