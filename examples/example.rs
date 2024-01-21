@@ -1,7 +1,8 @@
 use header_proxy_gateway;
 use hyper::client::HttpConnector;
 use hyper_tls::HttpsConnector;
-
+use std::future::Future;
+use std::pin::Pin;
 #[tokio::main]
 async fn main() {
     let config = header_proxy_gateway::Config {
@@ -10,8 +11,12 @@ async fn main() {
                _headers: &hyper::HeaderMap,
                _hyper_client: &hyper::Client<HttpsConnector<HttpConnector>>,
                _hyer_builder: &hyper::http::request::Builder|
-         -> (bool, String) {
-            return (true, String::from(""));
+         -> Pin<Box<dyn Future<Output = (bool, String)> + Send>> {
+            let future = async move {
+                return (true, String::from(""));
+            };
+
+            Box::pin(future)
         },
         clear_cache_interval_in_seconds: 5 * 60,
         redirects: vec![(

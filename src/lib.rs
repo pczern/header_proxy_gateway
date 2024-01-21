@@ -9,7 +9,9 @@ use hyper_tls;
 use hyper_tls::HttpsConnector;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio;
 use tokio::sync::Mutex;
@@ -27,7 +29,7 @@ pub struct Config {
         &HeaderMap,
         &hyper::Client<HttpsConnector<HttpConnector>>,
         &hyper::http::request::Builder,
-    ) -> (bool, String),
+    ) -> Pin<Box<dyn Future<Output = (bool, String)> + Send>>,
     pub clear_cache_interval_in_seconds: u64,
     pub redirects: HashMap<String, ConfigRedirect>,
 }
@@ -72,7 +74,7 @@ async fn handle_request(
     }
 
     let (is_authorized, auth_identifier) =
-        (config.auth)(redirect, req.headers(), &client, &request_builder);
+        (config.auth)(redirect, req.headers(), &client, &request_builder).await;
 
     if !is_authorized {
         return Err(hyper::Response::builder()
