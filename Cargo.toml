@@ -6,8 +6,6 @@ authors = ["Philipp Czernitzki <philip@czer.eu>"]
 readme = "README.md"
 license = "GNU AGPLv3"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 hyper = { version = "0.14", features = ["client", "server", "http1"] }
 hyper-tls = "0.5"
