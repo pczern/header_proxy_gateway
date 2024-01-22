@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use hyper;
 use hyper::body::Bytes;
 use hyper::client::HttpConnector;
@@ -9,9 +10,7 @@ use hyper_tls;
 use hyper_tls::HttpsConnector;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio;
 use tokio::sync::Mutex;
@@ -22,14 +21,32 @@ pub struct ConfigRedirect {
     pub url: String,
     pub headers: HashMap<String, String>,
 }
+
+// pub struct Config {
+//     pub addr: SocketAddr,
+//     pub auth: fn(
+//         &ConfigRedirect,
+//         &HeaderMap,
+//         &hyper::Client<HttpsConnector<HttpConnector>>,
+//         &mut hyper::http::request::Builder,
+//     ) -> Pin<Box<dyn Future<Output = (bool, String)> + Send>>,
+//     pub clear_cache_interval_in_seconds: u64,
+//     pub redirects: HashMap<String, ConfigRedirect>,
+// }
+#[async_trait]
+pub trait Auth: Send + Sync {
+    async fn authenticate(
+        &self,
+        redirect: &ConfigRedirect,
+        headers: &HeaderMap,
+        client: &hyper::Client<HttpsConnector<HttpConnector>>,
+        builder: hyper::http::request::Builder,
+    ) -> (bool, String, hyper::http::request::Builder);
+}
+
 pub struct Config {
     pub addr: SocketAddr,
-    pub auth: fn(
-        &ConfigRedirect,
-        &HeaderMap,
-        &hyper::Client<HttpsConnector<HttpConnector>>,
-        &hyper::http::request::Builder,
-    ) -> Pin<Box<dyn Future<Output = (bool, String)> + Send>>,
+    pub auth: Box<dyn Auth>,
     pub clear_cache_interval_in_seconds: u64,
     pub redirects: HashMap<String, ConfigRedirect>,
 }
@@ -73,8 +90,10 @@ async fn handle_request(
         request_builder = request_builder.header(key.as_str(), value.as_str());
     }
 
-    let (is_authorized, auth_identifier) =
-        (config.auth)(redirect, req.headers(), &client, &request_builder).await;
+    let (is_authorized, auth_identifier, builder) = config
+        .auth
+        .authenticate(redirect, req.headers(), &client, request_builder)
+        .await;
 
     if !is_authorized {
         return Err(hyper::Response::builder()
@@ -105,7 +124,7 @@ async fn handle_request(
         }
     }
 
-    let req = request_builder
+    let req = builder
         .method(hyper::Method::POST)
         .uri(redirect.url.clone())
         .header("Content-Type", "application/json")
@@ -198,7 +217,7 @@ pub async fn run_gateway(config: Config) {
                 let client = client.clone();
 
                 async {
-                    let handle = tokio::spawn(handle_request(config, req, cache, client));
+                    let handle = tokio::task::spawn(handle_request(config, req, cache, client));
                     let val: Result<hyper::Response<hyper::Body>, tokio::task::JoinError> =
                         match handle.await {
                             Ok(value) => match value {
