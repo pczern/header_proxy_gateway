@@ -15,8 +15,10 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio;
 use tokio::net::TcpListener;
+use tokio::time::sleep;
 
 pub struct ConfigRedirect {
     pub url: String,
@@ -84,9 +86,18 @@ async fn handle_request(
             .unwrap());
     }
 
-    let body = req.collect().await.unwrap().to_bytes();
+    let body_result = req.collect().await;
+    if body_result.is_err() {
+        if cfg!(debug_assertions) {
+            println!("Error: {}", body_result.err().unwrap());
+        }
+        return Err(hyper::Response::builder()
+            .status(500)
+            .body(Full::new(Bytes::from("Internal Server Error")))
+            .unwrap());
+    }
 
-    let req_result = builder.body(body).build();
+    let req_result = builder.body(body_result.unwrap().to_bytes()).build();
     if req_result.is_err() {
         if cfg!(debug_assertions) {
             println!("Error: {}", req_result.err().unwrap());
@@ -137,14 +148,16 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     if cfg!(debug_assertions) {
         pretty_env_logger::init();
     }
+    let manager = CACacheManager::default();
     let client = ClientBuilder::new(Client::new())
         .with(Cache(HttpCache {
             mode: CacheMode::Default,
-            manager: CACacheManager::default(),
+            manager: manager,
             options: HttpCacheOptions::default(),
         }))
         .build();
     let arc_config = Arc::new(config);
+
     let arc_client = Arc::new(client);
     let listener = TcpListener::bind(&arc_config.addr).await?;
     loop {
@@ -167,6 +180,22 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                 println!("Failed to serve the connection: {:?}", err);
+            }
+        });
+
+        let manager = CACacheManager::default();
+        let arc_config2 = Arc::clone(&arc_config);
+
+        // Spawn a task to clear the cache every 60 seconds
+        tokio::spawn(async move {
+            loop {
+                let arc_config = Arc::clone(&arc_config2);
+                sleep(Duration::from_secs(
+                    arc_config.clear_cache_interval_in_seconds,
+                ))
+                .await;
+                let manager_clone = manager.clone();
+                let _ = manager_clone.clear().await;
             }
         });
     }
