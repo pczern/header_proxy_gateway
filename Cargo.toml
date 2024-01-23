@@ -8,6 +8,12 @@ license = "GNU AGPLv3"
 
 [dependencies]
 async-trait = "0.1.77"
-hyper = { version = "0.14", features = ["client", "server", "http1"] }
-hyper-tls = "0.5"
+http-cache-reqwest = "0.13.0"
+hyper = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+reqwest = "0.11.23"
+reqwest-middleware = "0.2.4"
 tokio = { version = "1.8.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+pretty_env_logger = "0.5.0"
+bytes = "1.5.0"

@@ -1,47 +1,38 @@
+#![warn(clippy::pedantic)]
 use async_trait::async_trait;
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use http_body_util::Full;
+use http_cache_reqwest::{CACacheManager, Cache, CacheMode, HttpCache, HttpCacheOptions};
 use hyper;
-use hyper::body::Bytes;
-use hyper::client::HttpConnector;
-use hyper::service::make_service_fn;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::HeaderMap;
-use hyper::Server;
-use hyper_tls;
-use hyper_tls::HttpsConnector;
+use hyper_util::rt::TokioIo;
+use reqwest::Client;
+use reqwest_middleware::ClientBuilder;
 use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio;
-use tokio::sync::Mutex;
-
-pub type Cache = Arc<Mutex<(HashMap<String, Bytes>, VecDeque<String>)>>;
+use tokio::net::TcpListener;
 
 pub struct ConfigRedirect {
     pub url: String,
     pub headers: HashMap<String, String>,
+    pub method: reqwest::Method,
 }
 
-// pub struct Config {
-//     pub addr: SocketAddr,
-//     pub auth: fn(
-//         &ConfigRedirect,
-//         &HeaderMap,
-//         &hyper::Client<HttpsConnector<HttpConnector>>,
-//         &mut hyper::http::request::Builder,
-//     ) -> Pin<Box<dyn Future<Output = (bool, String)> + Send>>,
-//     pub clear_cache_interval_in_seconds: u64,
-//     pub redirects: HashMap<String, ConfigRedirect>,
-// }
 #[async_trait]
 pub trait Auth: Send + Sync {
     async fn authenticate(
         &self,
         redirect: &ConfigRedirect,
         headers: &HeaderMap,
-        client: &hyper::Client<HttpsConnector<HttpConnector>>,
-        builder: hyper::http::request::Builder,
-    ) -> (bool, String, hyper::http::request::Builder);
+        client: &reqwest_middleware::ClientWithMiddleware,
+        builder: reqwest_middleware::RequestBuilder,
+    ) -> (bool, reqwest_middleware::RequestBuilder);
 }
 
 pub struct Config {
@@ -53,44 +44,35 @@ pub struct Config {
 
 async fn handle_request(
     config: Arc<Config>,
-    req: hyper::Request<hyper::Body>,
-    cache: Cache,
-    client: hyper::Client<HttpsConnector<HttpConnector>>,
-) -> Result<hyper::Response<hyper::Body>, hyper::Response<hyper::Body>> {
+    req: hyper::Request<hyper::body::Incoming>,
+    client: &reqwest_middleware::ClientWithMiddleware,
+) -> Result<hyper::Response<Full<Bytes>>, hyper::Response<Full<Bytes>>> {
     let headers = req.headers();
     let x_server = headers.get("x-server");
-    let x_cache_id = headers.get("x-cache-id");
 
-    if x_server.is_none() || x_cache_id.is_none() || x_cache_id.unwrap().len() > 50 {
+    if x_server.is_none() || x_server.unwrap().to_str().is_err() {
         return Err(hyper::Response::builder()
             .status(400)
-            .body(hyper::Body::from("Bad Request: missing correct headers"))
+            .body(Full::new(Bytes::from(
+                "Bad Request: missing or malformed x-server header",
+            )))
             .unwrap());
     }
-
-    let server = match x_server.unwrap().to_str() {
-        Ok(value) => value,
-        Err(_) => {
-            return Err(hyper::Response::builder()
-                .status(400)
-                .body(hyper::Body::from("Bad Request: missing x-server header"))
-                .unwrap())
-        }
-    };
+    let server = x_server.unwrap().to_str().unwrap();
     if !config.redirects.contains_key(server) {
         return Err(hyper::Response::builder()
             .status(400)
-            .body(hyper::Body::from("Bad Request"))
+            .body(Full::new(Bytes::from("Bad Request")))
             .unwrap());
     }
-
-    let mut request_builder = hyper::Request::builder();
     let redirect = config.redirects.get(server).unwrap();
+    let mut request_builder = client.request(redirect.method.clone(), redirect.url.clone());
+    // Append set headers for redirect route
     for (key, value) in &redirect.headers {
         request_builder = request_builder.header(key.as_str(), value.as_str());
     }
 
-    let (is_authorized, auth_identifier, builder) = config
+    let (is_authorized, builder) = config
         .auth
         .authenticate(redirect, req.headers(), &client, request_builder)
         .await;
@@ -98,155 +80,94 @@ async fn handle_request(
     if !is_authorized {
         return Err(hyper::Response::builder()
             .status(401)
-            .body(hyper::Body::from("Unauthorized"))
+            .body(Full::new(Bytes::from("Unauthorized")))
             .unwrap());
     }
 
-    let cache_id = match x_cache_id.unwrap().to_str() {
-        Ok(value) => value,
-        Err(_) => {
-            return Err(hyper::Response::builder()
-                .status(400)
-                .body(hyper::Body::from("Bad Request: missing x-cache-id header"))
-                .unwrap())
+    let body = req.collect().await.unwrap().to_bytes();
+
+    let req_result = builder.body(body).build();
+    if req_result.is_err() {
+        if cfg!(debug_assertions) {
+            println!("Error: {}", req_result.err().unwrap());
         }
-    };
-    let cache_identifier = auth_identifier + cache_id;
-    {
-        // release lock on mutex after code block
-        let cache_mutex_guard = cache.lock().await;
-        if let Some(cached_value) = cache_mutex_guard.0.get(&cache_identifier) {
-            return Ok(hyper::Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(hyper::Body::from(cached_value.clone()))
-                .unwrap());
-        }
+        return Err(hyper::Response::builder()
+            .status(500)
+            .body(Full::new(Bytes::from("Internal Server Error")))
+            .unwrap());
     }
 
-    let req = builder
-        .method(hyper::Method::POST)
-        .uri(redirect.url.clone())
-        .header("Content-Type", "application/json")
-        .body(req.into_body())
-        .unwrap();
-
-    return match client.request(req).await {
-        Ok(res) => {
-            if res.headers().get("content-type") == None
-                || res.headers().get("content-type").unwrap().to_str().is_err()
-                || !res
-                    .headers()
-                    .get("content-type")
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .starts_with("application/json")
-            {
-                if cfg!(debug_assertions) {
-                    println!("Error: content-type");
-                }
-                return Err(hyper::Response::builder()
-                    .status(500)
-                    .body(hyper::Body::from("Internal Server Error"))
-                    .unwrap());
-            }
-
-            let body = res.into_body();
-            let bytes: Bytes = match hyper::body::to_bytes(body).await {
-                Ok(body_bytes) => body_bytes,
-                Err(e) => {
-                    if cfg!(debug_assertions) {
-                        println!("Error: {}", e);
-                    }
-                    return Err(hyper::Response::builder()
-                        .status(500)
-                        .body(hyper::Body::from("Internal Server Error"))
-                        .unwrap());
-                }
-            };
-            let arc_bytes: Arc<Bytes> = Arc::new(bytes);
-            let arc_bytes2: Arc<Bytes> = Arc::clone(&arc_bytes);
-            tokio::spawn(async move {
-                let mut cache = cache.lock().await;
-                if cache.1.len() > 100 {
-                    if let Some(old_hash) = cache.1.pop_front() {
-                        cache.0.remove(&old_hash);
-                    }
-                }
-                cache
-                    .0
-                    .insert(cache_identifier.clone(), arc_bytes.as_ref().clone());
-                cache.1.push_back(cache_identifier);
-            });
-
-            Ok(hyper::Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(hyper::Body::from(arc_bytes2.as_ref().clone()))
-                .unwrap())
+    let res_result = client.execute(req_result.unwrap()).await;
+    if res_result.is_err() {
+        if cfg!(debug_assertions) {
+            println!("Error: {}", res_result.err().unwrap());
         }
-        Err(e) => {
-            if cfg!(debug_assertions) {
-                println!("Error: {}", e);
-            }
+        return Err(hyper::Response::builder()
+            .status(500)
+            .body(Full::new(Bytes::from("Internal Server Error")))
+            .unwrap());
+    }
+    let res = res_result.unwrap();
+    let headers = res.headers();
+    let mut res_builder = hyper::Response::builder();
 
-            Err(hyper::Response::builder()
-                .status(500)
-                .body(hyper::Body::from("Internal Server Error"))
-                .unwrap())
+    for (key, value) in headers {
+        res_builder = res_builder.header(key.as_str(), value.as_bytes());
+    }
+
+    let body_bytes_result = res.bytes().await;
+    if body_bytes_result.is_err() {
+        if cfg!(debug_assertions) {
+            println!("Error: {}", body_bytes_result.err().unwrap());
         }
-    };
+        return Err(hyper::Response::builder()
+            .status(500)
+            .body(Full::new(Bytes::from("Internal Server Error")))
+            .unwrap());
+    }
+    let body = body_bytes_result.unwrap();
+
+    Ok(res_builder
+        .status(200)
+        .body(Full::new(Bytes::from(body)))
+        .unwrap())
 }
 
-pub async fn run_gateway(config: Config) {
-    let glob_cache = Arc::new(Mutex::new((HashMap::new(), VecDeque::new())));
-    let glob_config = Arc::new(config);
-    let cache = Arc::clone(&glob_cache);
-    let config = Arc::clone(&glob_config);
-    let https = hyper_tls::HttpsConnector::new();
-    let client = hyper::Client::builder().build::<_, hyper::Body>(https);
-    let make_svc = make_service_fn(move |_conn| {
-        let cache = Arc::clone(&cache);
-        let config = Arc::clone(&config);
-        let client = client.clone();
-        async move {
-            Ok::<_, tokio::task::JoinError>(service_fn(move |req| {
-                let cache = Arc::clone(&cache);
-                let config = Arc::clone(&config);
-                let client = client.clone();
-
-                async {
-                    let handle = tokio::task::spawn(handle_request(config, req, cache, client));
-                    let val: Result<hyper::Response<hyper::Body>, tokio::task::JoinError> =
-                        match handle.await {
-                            Ok(value) => match value {
-                                Ok(value) => Ok(value),
-                                Err(err) => Ok(err), // we want to send error responses, rather than drop the connection
-                            },
-                            Err(err) => Err(err),
-                        };
-                    val
-                }
-            }))
-        }
-    });
-
-    let server = Server::bind(&glob_config.addr).serve(make_svc);
-
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
+pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(debug_assertions) {
+        pretty_env_logger::init();
     }
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
-            glob_config.clear_cache_interval_in_seconds,
-        ));
-        loop {
-            interval.tick().await;
-            let mut cache = glob_cache.lock().await;
-            cache.0.clear();
-            cache.1.clear();
-        }
-    });
+    let client = ClientBuilder::new(Client::new())
+        .with(Cache(HttpCache {
+            mode: CacheMode::Default,
+            manager: CACacheManager::default(),
+            options: HttpCacheOptions::default(),
+        }))
+        .build();
+    let arc_config = Arc::new(config);
+    let arc_client = Arc::new(client);
+    let listener = TcpListener::bind(&arc_config.addr).await?;
+    loop {
+        let arc_config_clone = Arc::clone(&arc_config);
+        let arc_client_clone = Arc::clone(&arc_client);
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let service = service_fn(move |req| {
+            let arc_config_clone = Arc::clone(&arc_config_clone);
+            let arc_client_clone = Arc::clone(&arc_client_clone);
+            async move {
+                let val =
+                    match handle_request(arc_config_clone, req, arc_client_clone.as_ref()).await {
+                        Ok(value) => value,
+                        Err(err) => err,
+                    };
+                Ok::<_, Infallible>(val)
+            }
+        });
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                println!("Failed to serve the connection: {:?}", err);
+            }
+        });
+    }
 }
