@@ -3,7 +3,6 @@
 A very fast and efficient gateway proxying and caching requests to other servers based on header attributes.
 It was initially built to provide a single endpoint for authentication and access to multiple proxied GraphQL servers, but can be used as proxy to any http API.
 
-
 ## Example
 For each request the `x-server` header has to be provided.<br>
 Based on `x-server` the gateway knows to which server the proxied request has to be sent.<br> `x-server` should be equaivalent to the key in the hashmap here: **"example"**.<br>
