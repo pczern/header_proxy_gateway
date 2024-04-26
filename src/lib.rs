@@ -51,7 +51,15 @@ async fn handle_request(
 ) -> Result<hyper::Response<Full<Bytes>>, hyper::Response<Full<Bytes>>> {
     let headers = req.headers();
     let x_server = headers.get("x-server");
-
+    if (x_server.is_none() || x_server.unwrap().to_str().is_err()) && req.method() == hyper::Method::OPTIONS {
+        return Ok(hyper::Response::builder()
+            .status(200)
+            .header(hyper::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(hyper::http::header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+            .header(hyper::http::header::ACCESS_CONTROL_ALLOW_METHODS, "*")
+            .body(Full::new(Bytes::from("")))
+            .unwrap());
+    }
     if x_server.is_none() || x_server.unwrap().to_str().is_err() {
         return Err(hyper::Response::builder()
             .status(400)
@@ -62,7 +70,7 @@ async fn handle_request(
                 "Bad Request: missing or malformed x-server header",
             )))
             .unwrap());
-    }
+    } 
     let server = x_server.unwrap().to_str().unwrap();
     if !config.redirects.contains_key(server) {
         return Err(hyper::Response::builder()
@@ -189,7 +197,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let arc_client_clone = Arc::clone(&arc_client);
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
-   
+           
         let service = service_fn(move |req| {
             let arc_config_clone = Arc::clone(&arc_config_clone);
             let arc_client_clone = Arc::clone(&arc_client_clone);
@@ -202,6 +210,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 Ok::<_, Infallible>(val)
             }
         });
+
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                 println!("Failed to serve the connection: {:?}", err);
