@@ -55,6 +55,7 @@ async fn handle_request(
     if x_server.is_none() || x_server.unwrap().to_str().is_err() {
         return Err(hyper::Response::builder()
             .status(400)
+            .header("Access-Control-Allow-Origin", "*")
             .body(Full::new(Bytes::from(
                 "Bad Request: missing or malformed x-server header",
             )))
@@ -64,6 +65,7 @@ async fn handle_request(
     if !config.redirects.contains_key(server) {
         return Err(hyper::Response::builder()
             .status(400)
+            .header("Access-Control-Allow-Origin", "*")
             .body(Full::new(Bytes::from("Bad Request")))
             .unwrap());
     }
@@ -82,6 +84,7 @@ async fn handle_request(
     if !is_authorized {
         return Err(hyper::Response::builder()
             .status(401)
+            .header("Access-Control-Allow-Origin", "*")
             .body(Full::new(Bytes::from("Unauthorized")))
             .unwrap());
     }
@@ -93,6 +96,7 @@ async fn handle_request(
         }
         return Err(hyper::Response::builder()
             .status(500)
+            .header("Access-Control-Allow-Origin", "*")
             .body(Full::new(Bytes::from("Internal Server Error")))
             .unwrap());
     }
@@ -104,6 +108,7 @@ async fn handle_request(
         }
         return Err(hyper::Response::builder()
             .status(500)
+            .header("Access-Control-Allow-Origin", "*")
             .body(Full::new(Bytes::from("Internal Server Error")))
             .unwrap());
     }
@@ -115,6 +120,7 @@ async fn handle_request(
         }
         return Err(hyper::Response::builder()
             .status(500)
+            .header("Access-Control-Allow-Origin", "*")
             .body(Full::new(Bytes::from("Internal Server Error")))
             .unwrap());
     }
@@ -133,6 +139,7 @@ async fn handle_request(
         }
         return Err(hyper::Response::builder()
             .status(500)
+            .header("Access-Control-Allow-Origin", "*")
             .body(Full::new(Bytes::from("Internal Server Error")))
             .unwrap());
     }
@@ -140,6 +147,7 @@ async fn handle_request(
 
     Ok(res_builder
         .status(200)
+        .header("Access-Control-Allow-Origin", "*")
         .body(Full::new(Bytes::from(body)))
         .unwrap())
 }
@@ -200,3 +208,4 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 }
+f
